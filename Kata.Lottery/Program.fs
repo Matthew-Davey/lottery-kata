@@ -1,4 +1,6 @@
-﻿open System.Diagnostics
+﻿open System.Collections.Concurrent
+open System.Collections.Generic
+open System.Diagnostics
 open System.IO
 open System.Runtime.Intrinsics.X86
 open System.Threading.Tasks;
@@ -12,6 +14,16 @@ module Array =
                 fn arr[i] |> Seq.iteri (fun j value -> result[(i * n) + j] <- value)
             )) |> ignore
             result
+
+        let countById (arr: uint32[]) =
+            let map = ConcurrentDictionary<uint32, int32>()
+            Parallel.ForEach(arr, fun x ->
+                map.AddOrUpdate(x, 1, (fun _ value -> value + 1)) |> ignore
+            ) |> ignore
+            map
+            |> Seq.map (fun kv -> (kv.Key, kv.Value))
+            |> Array.ofSeq
+
 
 let inline createBitVector64 [|x0; x1; x2; x3; x4; x5|] =
     (1uL <<< int x0) ||| (1uL <<< int x1) ||| (1uL <<< int x2) ||| (1uL <<< int x3) ||| (1uL <<< int x4) ||| (1uL <<< int x5)
@@ -54,7 +66,7 @@ timer.Restart()
 let combinationCounts =
     tickets
     |> Array.Parallel.collectn 20 combinations
-    |> Array.countBy id
+    |> Array.Parallel.countById
 timer.Stop()
 
 combinationCounts
