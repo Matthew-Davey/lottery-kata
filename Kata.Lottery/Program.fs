@@ -1,77 +1,101 @@
-﻿open System.Collections.Concurrent
-open System.Collections.Generic
+﻿open System
 open System.Diagnostics
 open System.IO
+open System.Runtime.InteropServices
 open System.Runtime.Intrinsics.X86
-open System.Threading.Tasks;
+open FSharp.NativeInterop
 
-module Array =
-    module Parallel =
-        let collectn n fn arr =
-            let length = Array.length arr
-            let result = Array.zeroCreate (length * n)
-            Parallel.For(0, length, (fun i ->
-                fn arr[i] |> Seq.iteri (fun j value -> result[(i * n) + j] <- value)
-            )) |> ignore
-            result
+let inline (|||) (a: uint64) (b: uint64) = (# "or" a b : uint64 #)
+let inline (&&&) (a: uint64) (b: uint64) = (# "and" a b : uint64 #)
+let inline (<<<) a b = (# "shl" a b : uint64 #)
 
-        let countById (arr: uint32[]) =
-            let map = ConcurrentDictionary<uint32, int32>()
-            Parallel.ForEach(arr, fun x ->
-                map.AddOrUpdate(x, 1, (fun _ value -> value + 1)) |> ignore
-            ) |> ignore
-            map
-            |> Seq.map (fun kv -> (kv.Key, kv.Value))
-            |> Array.ofSeq
+let loadTickets (filePath: string) =
+    // Load the contents of the file into native memory. Unfortunately there is too much data to use stack memory...
+    let fileStream = new FileStream(path = filePath, mode = FileMode.Open, access = FileAccess.Read, share = FileShare.None, bufferSize = 4096, options = FileOptions.SequentialScan)
+    let fileContent = Marshal.AllocHGlobal(int fileStream.Length)
+    let fileSpan = Span(fileContent.ToPointer(), int fileStream.Length)
+    fileStream.ReadExactly(fileSpan)
+    
+    let mutable index = 0
 
+    // Allocate a region of memory large enough to hold all our tickets...
+    let tickets = Marshal.AllocHGlobal(sizeof<uint64> * 1_000_000)
+    let mutable ptr = NativePtr.ofNativeInt tickets
+    
+    for i in 0..999_999 do
+        let mutable ticket = 0uL
+        
+        // Read the first 5 numbers of the ticket.
+        // Read two bytes at a time. We know that the first byte will be a digit (we derive the digit value by
+        // subtracting 48, which is the offset of the digits in the ASCII table). If the second byte is a comma, the
+        // number is the value of the first digit. If the second byte is another digit, the number is the value of the
+        // first digit * 10, plus the value of the second digit. In this case we also know that the following byte will
+        // definitely be a comma, so we can skip over that.
+        // For each number we deduce, we flip the corresponding bit in the ticket...
+        for _ in 0..4 do
+            let a, b = fileSpan[index], fileSpan[index + 1]
+            index <- index + 2
 
-let inline createBitVector64 [|x0; x1; x2; x3; x4; x5|] =
-    (1uL <<< int x0) ||| (1uL <<< int x1) ||| (1uL <<< int x2) ||| (1uL <<< int x3) ||| (1uL <<< int x4) ||| (1uL <<< int x5)
+            if b = 44uy then
+                ticket <- ticket ||| (1uL <<< (a - 48uy))
+            else
+                ticket <- ticket ||| (1uL <<< (((a - 48uy) * 10uy) + (b - 48uy)))
+                index <- index + 1
+        
+        // Read the 6th number of the ticket. The algorithm is the same except we check for a newline character instead
+        // of a comma...        
+        let a, b = fileSpan[index], fileSpan[index + 1]
+        index <- index + 2
+        
+        if b = 10uy then
+            ticket <- ticket ||| (1uL <<< (a - 48uy)) 
+        else
+            ticket <- ticket||| (1uL <<< (((a - 48uy) * 10uy) + (b - 48uy))) 
+            index <- index + 1
+        
+        NativePtr.set ptr i ticket
+            
+    tickets
+    
+let countWins x0 x1 x2 x3 x4 x5 (tickets: nativeint) =
+    // For this algorithm the draw must be expressed in the same way as the tickets. That is, for each number, the
+    // corresponding bit must be flipped in a 64 bit integer...
+    let draw = (1uL <<< x0) ||| (1uL <<< x1) ||| (1uL <<< x2) ||| (1uL <<< x3) ||| (1uL <<< x4) ||| (1uL <<< x5)
+    
+    let mutable match5 = 0
+    let mutable match4 = 0
+    let mutable match3 = 0
+    
+    let mutable ptr = NativePtr.ofNativeInt tickets
+    
+    for i in 0..999_999 do
+        // Count the number of matching numbers by performing a bitwise AND between the draw and the ticket. The
+        // resulting value will have positive bits only where there was a match between the draw and the ticket. We use
+        // the SSE4.2 pop count instruction to count the number of populated bits. Keep a record of how many tickets
+        // matched 3, 4 or 5 numbers...
+        let ticket = NativePtr.get ptr i
+        let matches = Popcnt.X64.PopCount (draw &&& ticket)
+        if matches = 5uL then match5 <- match5 + 1
+        if matches = 4uL then match4 <- match4 + 1
+        if matches = 3uL then match3 <- match3 + 1
+    
+    [(5, match5); (4, match4); (3, match3)]
 
 let timer = Stopwatch.StartNew()
-let tickets = File.ReadAllLines (__SOURCE_DIRECTORY__ + "/../Tickets1M.csv")
-              |> Array.Parallel.map (fun line -> line.Split ',' |> Array.map uint8)
+let tickets = loadTickets "./Tickets1M.csv"
 timer.Stop()
-printfn $"%i{Array.length tickets} rows parsed in %i{timer.ElapsedMilliseconds} milliseconds\n"
 
-let inline countWinningNumbers draw ticket =
-    let mask = createBitVector64 ticket
-    let winningNumbers = draw &&& mask
-    Popcnt.X64.PopCount winningNumbers |> uint8
-
+printfn $"1,000,000 rows parsed in %i{timer.ElapsedMilliseconds} milliseconds"
+printfn "(17ms to beat)\n"
+   
 timer.Restart()
-let draw = createBitVector64 [|5; 10; 20; 34; 42; 57|]
-let matches = tickets
-              |> Array.map (countWinningNumbers draw)
-              |> Array.filter ((<=) 3uy)
-              |> Array.countBy id
+let wins = countWins 5 10 20 34 42 57 tickets
 timer.Stop()
 
-matches
-    |> Array.sortByDescending fst
-    |> Array.iter (fun (matches, count) -> printfn $"tickets with %i{matches} winning number(s): %i{count}")
+// expect 7, 425, 10615
+wins |> List.iter (fun (matches, count) -> printfn $"tickets with %i{matches} winning number(s): %i{count}")
 
-printfn $"\n%i{Array.length tickets} tickets checked in %i{timer.ElapsedMilliseconds} milliseconds\n"
+printfn $"1,000,000 tickets checked in %i{timer.ElapsedMilliseconds} milliseconds"
+printfn "(0 milliseconds to beat)"
 
-let inline combinations (xs: uint8[]) =
-    let length = Array.length xs
-    seq {
-        for i in 0..(length - 3) do
-        for j in (i + 1)..(length - 2) do
-        for k in (j + 1)..(length - 1) do
-            yield(uint32 xs[i] <<< 16) ||| (uint32 xs[j] <<< 8) ||| (uint32 xs[k])
-    }
-
-timer.Restart()
-let combinationCounts =
-    tickets
-    |> Array.Parallel.collectn 20 combinations
-    |> Array.Parallel.countById
-timer.Stop()
-
-combinationCounts
-|> Array.filter (fun (_, count) -> count >= 700)
-|> Array.sortByDescending snd
-|> Array.iter (fun (combination, count) -> printfn $"%032B{combination} occurred %i{count} times")
-
-printfn $"\nmost common combinations calculated in %i{timer.ElapsedMilliseconds} milliseconds"
+Marshal.FreeHGlobal(tickets)
